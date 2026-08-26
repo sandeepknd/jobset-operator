@@ -299,6 +299,7 @@ func testUnmanagedScaling(t testing.TB, ctx context.Context, kubeClient *k8sclie
 	}()
 
 	setManagementState(t, ctx, jobSetOperatorClient, jobsetOperator, v1.Unmanaged)
+	waitForManagementStateProcessed(t, ctx, kubeClient, jobSetOperatorClient, v1.Unmanaged)
 	scaleDeployment(t, ctx, kubeClient, oteOperandName, 3)
 	verifyPodCount(t, ctx, kubeClient, oteOperatorNamespace, oteOperandLabel, 3)
 }
@@ -320,6 +321,7 @@ func testRemovedStateScaling(t testing.TB, ctx context.Context, kubeClient *k8sc
 	}()
 
 	setManagementState(t, ctx, jobSetOperatorClient, jobsetOperator, v1.Removed)
+	waitForManagementStateProcessed(t, ctx, kubeClient, jobSetOperatorClient, v1.Removed)
 	scaleDeployment(t, ctx, kubeClient, oteOperandName, 3)
 	verifyPodCount(t, ctx, kubeClient, oteOperatorNamespace, oteOperandLabel, 3)
 }
@@ -346,6 +348,65 @@ func setManagementState(t testing.TB, ctx context.Context, jobSetOperatorClient 
 	if retryErr != nil {
 		t.Fatalf("Failed to set management state to %s: %v", state, retryErr)
 	}
+}
+
+// waitForManagementStateProcessed waits until the reconciler has processed a
+// management-state change so that it will not overwrite a subsequent manual
+// scale.
+//
+// A direct API poll only confirms the etcd write; the reconciler reads from
+// its informer cache, which may lag. To close the race, this function:
+//
+//  1. Records the current deployment spec generation.
+//  2. Patches a disposable annotation on the operand deployment, which forces
+//     the deployment informer to fire and enqueue a sync in the reconciler.
+//  3. Polls until the operator CR reflects the expected state with no degraded
+//     condition (confirming a sync cycle completed) and the deployment spec
+//     generation has not drifted. If a stale-cache sync overwrites the spec,
+//     the generation changes and the poll retries until the cache catches up.
+func waitForManagementStateProcessed(t testing.TB, ctx context.Context, kubeClient *k8sclient.Clientset, jobSetOperatorClient jobsetoperatorv1clientset.JobSetOperatorInterface, expectedState v1.ManagementState) {
+	t.Helper()
+
+	dep, err := kubeClient.AppsV1().Deployments(oteOperatorNamespace).Get(ctx, oteOperandName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get deployment: %v", err)
+	}
+	expectedGen := dep.Generation
+
+	syncTrigger := fmt.Sprintf(`{"metadata":{"annotations":{"test.openshift.io/sync-trigger":"%s"}}}`,
+		time.Now().Format(time.RFC3339Nano))
+	_, err = kubeClient.AppsV1().Deployments(oteOperatorNamespace).Patch(
+		ctx, oteOperandName, types.StrategicMergePatchType,
+		[]byte(syncTrigger), metav1.PatchOptions{})
+	if err != nil {
+		t.Fatalf("Failed to patch deployment to trigger sync: %v", err)
+	}
+
+	o.Eventually(func() error {
+		operator, err := jobSetOperatorClient.Get(ctx, "cluster", metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get operator: %v", err)
+		}
+		if operator.Spec.ManagementState != expectedState {
+			return fmt.Errorf("managementState: want %s, got %s", expectedState, operator.Spec.ManagementState)
+		}
+		for _, cond := range operator.Status.Conditions {
+			if strings.HasSuffix(cond.Type, v1.OperatorStatusTypeDegraded) && cond.Status == v1.ConditionTrue {
+				return fmt.Errorf("operator degraded: %s", cond.Message)
+			}
+		}
+
+		dep, err := kubeClient.AppsV1().Deployments(oteOperatorNamespace).Get(ctx, oteOperandName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get deployment: %v", err)
+		}
+		if dep.Generation != expectedGen {
+			expectedGen = dep.Generation
+			return fmt.Errorf("deployment generation drifted, reconciler may have stale cache")
+		}
+		return nil
+	}, 60*time.Second, 2*time.Second).Should(o.Succeed(),
+		"reconciler should complete processing management state %s", expectedState)
 }
 
 func scaleDeployment(t testing.TB, ctx context.Context, kubeClient *k8sclient.Clientset, operandName string, replicas int32) {
